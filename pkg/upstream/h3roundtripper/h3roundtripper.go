@@ -22,12 +22,13 @@ package h3roundtripper
 import (
 	"context"
 	"crypto/tls"
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/http3"
-	"go.uber.org/zap"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"go.uber.org/zap"
 )
 
 const (
@@ -40,7 +41,7 @@ var (
 
 // H3RTHelper is a helper of original http3.RoundTripper.
 // This is a workaround of
-// https://github.com/lucas-clemente/quic-go/issues/765
+// https://github.com/quic-go/quic-go/issues/765
 type H3RTHelper struct {
 	Logger     *zap.Logger
 	TLSConfig  *tls.Config
@@ -65,7 +66,7 @@ func (h *H3RTHelper) getRT() *http3.RoundTripper {
 		h.rt = &http3.RoundTripper{
 			Dial:            h.DialFunc,
 			TLSClientConfig: h.TLSConfig,
-			QuicConfig:      h.QUICConfig,
+			QUICConfig:      h.QUICConfig,
 		}
 	}
 	return h.rt

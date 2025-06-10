@@ -23,13 +23,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"time"
+
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/IrineSistiana/mosdns/v4/coremain"
 	"github.com/IrineSistiana/mosdns/v4/pkg/executable_seq"
 	"github.com/IrineSistiana/mosdns/v4/pkg/query_context"
 	"github.com/miekg/dns"
-	"net"
-	"time"
 )
 
 const PluginType = "forward"
@@ -90,8 +91,12 @@ func newForwarder(bp *coremain.BP, args *Args) (*forwardPlugin, error) {
 		}
 
 		opt := &upstream.Options{}
-		opt.Bootstrap = args.Bootstrap
-		opt.ServerIPAddrs = serverIPAddrs
+		resolver, err := upstream.NewUpstreamResolver(conf.Addr, opt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create upstream resolver for %s: %w", conf.Addr, err)
+		}
+
+		opt.Bootstrap = resolver
 
 		opt.Timeout = time.Second * 10
 		if args.Timeout > 0 {
