@@ -21,12 +21,15 @@ package data_provider
 
 import (
 	"fmt"
-	"github.com/IrineSistiana/mosdns/v4/pkg/safe_close"
-	"github.com/fsnotify/fsnotify"
-	"go.uber.org/zap"
+	"io"
+	"net/http"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/IrineSistiana/mosdns/v4/pkg/safe_close"
+	"github.com/fsnotify/fsnotify"
+	"go.uber.org/zap"
 )
 
 type DataManager struct {
@@ -60,12 +63,19 @@ type DataProviderConfig struct {
 	Tag        string `yaml:"tag"`
 	File       string `yaml:"file"`
 	AutoReload bool   `yaml:"auto_reload"`
+	Remote     string `yaml:"remote"` // remote data provider, e.g. http://example.com/data.json
 }
 
 type DataProvider struct {
 	logger     *zap.Logger
 	file       string
 	autoReload bool
+
+	Remote string // remote data provider, e.g. http://example.com/data.json
+
+	// 添加 ETag 缓存字段
+	etag   string
+	etagMu sync.RWMutex
 
 	lm        sync.Mutex
 	listeners map[DataListener]struct{}
@@ -78,6 +88,7 @@ func NewDataProvider(lg *zap.Logger, cfg DataProviderConfig) (*DataProvider, err
 	dp.logger = lg
 	dp.file = cfg.File
 	dp.autoReload = cfg.AutoReload
+	dp.Remote = cfg.Remote
 
 	dp.sc = safe_close.NewSafeClose()
 
@@ -88,14 +99,53 @@ func NewDataProvider(lg *zap.Logger, cfg DataProviderConfig) (*DataProvider, err
 }
 
 func (ds *DataProvider) init() error {
-	_, err := ds.loadFromDisk()
-	if err != nil {
-		return err
+	if ds.Remote != "" {
+		// 对于远程数据源，优先使用本地文件（如果存在）
+		if ds.file != "" {
+			if _, err := os.Stat(ds.file); err == nil {
+				// 本地文件存在，使用本地文件
+				_, err := ds.loadFromDisk()
+				if err != nil {
+					return err
+				}
+			} else {
+				// 本地文件不存在，从远程加载
+				_, err := ds.loadFromRemote()
+				if err != nil {
+					return err
+				}
+			}
+		} else {
+			// 没有指定本地文件，直接从远程加载
+			_, err := ds.loadFromRemote()
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		_, err := ds.loadFromDisk()
+		if err != nil {
+			return err
+		}
 	}
 
 	if ds.autoReload {
-		if err := ds.startFsWatcher(); err != nil {
-			return fmt.Errorf("failed to start fs watcher, %w", err)
+		if ds.Remote == "" {
+			ds.logger.Info(
+				"auto reload enabled, will watch file for changes",
+				zap.String("file", ds.file),
+			)
+			if err := ds.startFsWatcher(); err != nil {
+				return fmt.Errorf("failed to start fs watcher, %w", err)
+			}
+		} else {
+			ds.logger.Info(
+				"auto reload enabled, will watch remote for changes",
+				zap.String("remote", ds.Remote),
+			)
+			if err := ds.startRemoteWatcher(); err != nil {
+				return fmt.Errorf("failed to start remote watcher, %w", err)
+			}
 		}
 	}
 	return nil
@@ -134,6 +184,9 @@ func (ds *DataProvider) DeleteListener(l DataListener) {
 }
 
 func (ds *DataProvider) GetData() ([]byte, error) {
+	if ds.Remote != "" {
+		return ds.loadFromRemote()
+	}
 	return os.ReadFile(ds.file)
 }
 
@@ -224,6 +277,121 @@ func (ds *DataProvider) startFsWatcher() error {
 					return
 				}
 				ds.logger.Error("fs notify error", zap.Error(err))
+			case <-ds.sc.ReceiveCloseSignal():
+				return
+			}
+		}
+	}()
+	return nil
+}
+
+func (ds *DataProvider) loadFromRemote() ([]byte, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	req, err := http.NewRequest("GET", ds.Remote, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// 添加 If-None-Match 头部以支持 ETag
+	ds.etagMu.RLock()
+	if ds.etag != "" {
+		req.Header.Set("If-None-Match", ds.etag)
+	}
+	ds.etagMu.RUnlock()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch remote data: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotModified {
+		ds.logger.Debug(
+			"remote data not modified",
+			zap.String("remote", ds.Remote),
+			zap.String("etag", ds.etag),
+		)
+		// 数据未更改，返回当前缓存的数据
+		if ds.file != "" {
+			return os.ReadFile(ds.file)
+		}
+		return nil, fmt.Errorf("remote data not modified and no local cache available")
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// 更新 ETag
+	if newEtag := resp.Header.Get("ETag"); newEtag != "" {
+		ds.etagMu.Lock()
+		ds.etag = newEtag
+		ds.etagMu.Unlock()
+	}
+
+	// 如果设置了本地文件路径，则缓存到本地
+	if ds.file != "" {
+		if err := os.WriteFile(ds.file, data, 0644); err != nil {
+			ds.logger.Warn("failed to cache remote data to local file", zap.Error(err))
+		}
+	}
+
+	return data, nil
+}
+
+func (ds *DataProvider) startRemoteWatcher() error {
+	go func() {
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				ds.logger.Info("checking for remote data updates", zap.String("remote", ds.Remote))
+
+				// 记录检查前的 ETag
+				ds.etagMu.RLock()
+				oldEtag := ds.etag
+				ds.etagMu.RUnlock()
+
+				if v, err := ds.loadFromRemote(); err != nil {
+					ds.logger.Error(
+						"failed to reload remote data",
+						zap.String("remote", ds.Remote),
+						zap.Error(err),
+					)
+				} else {
+					// 获取检查后的 ETag
+					ds.etagMu.RLock()
+					newEtag := ds.etag
+					ds.etagMu.RUnlock()
+
+					// 如果是第一次检查（oldEtag为空）或者ETag发生变化，则认为数据已更新
+					if oldEtag == "" || oldEtag != newEtag {
+						ds.logger.Info(
+							"remote data updated",
+							zap.String("remote", ds.Remote),
+							zap.String("old_etag", oldEtag),
+							zap.String("new_etag", newEtag),
+						)
+						ds.pushData(v)
+					} else {
+						ds.logger.Debug(
+							"remote data not changed",
+							zap.String("remote", ds.Remote),
+							zap.String("etag", newEtag),
+						)
+					}
+				}
+
 			case <-ds.sc.ReceiveCloseSignal():
 				return
 			}
