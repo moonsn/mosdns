@@ -355,7 +355,7 @@ func (ds *DataProvider) startRemoteWatcher() error {
 		for {
 			select {
 			case <-ticker.C:
-				ds.logger.Info("checking for remote data updates", zap.String("remote", ds.Remote))
+				ds.logger.Debug("checking for remote data updates", zap.String("remote", ds.Remote))
 
 				// 记录检查前的 ETag
 				ds.etagMu.RLock()

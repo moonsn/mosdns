@@ -47,7 +47,8 @@ func init() {
 var _ coremain.ExecutablePlugin = (*logger)(nil)
 
 type Args struct {
-	Msg string `yaml:"msg"`
+	EnableLocalLog bool   `yaml:"enable_local_log"` // 是否启用本地日志
+	Msg            string `yaml:"msg"`
 	// 群晖日志服务配置
 	SynologyLog *SynologyLogConfig `yaml:"synology_log"`
 }
@@ -80,6 +81,8 @@ func (a *Args) init() {
 type logger struct {
 	args      *Args
 	syslogger *syslog.Writer
+	logChan   chan string // 异步日志通道
+	LocalLog  bool        // 是否启用本地日志
 	*coremain.BP
 }
 
@@ -90,9 +93,9 @@ func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
 
 func newLogger(bp *coremain.BP, args *Args) coremain.Plugin {
 	args.init()
-	l := &logger{BP: bp, args: args}
+	l := &logger{BP: bp, args: args, LocalLog: args.EnableLocalLog}
 
-	// 如果启用了群晖日志，初始化 syslog 连接
+	// 如果启用了群晖日志，初始化 syslog 连接和异步处理
 	if args.SynologyLog != nil && args.SynologyLog.Enabled {
 		network := args.SynologyLog.Protocol
 		addr := fmt.Sprintf("%s:%d", args.SynologyLog.Host, args.SynologyLog.Port)
@@ -102,7 +105,11 @@ func newLogger(bp *coremain.BP, args *Args) coremain.Plugin {
 			bp.L().Error("failed to connect to synology syslog", zap.Error(err))
 		} else {
 			l.syslogger = syslogger
+			l.logChan = make(chan string, 1000) // 缓冲通道，避免阻塞
 			bp.L().Info("connected to synology syslog", zap.String("addr", addr))
+
+			// 启动异步日志处理 goroutine
+			go l.asyncLogHandler()
 		}
 	}
 
@@ -151,35 +158,37 @@ func (l *logger) Exec(ctx context.Context, qCtx *query_context.Context, next exe
 		}
 	}
 
-	// 构建日志字段
-	logFields := []zap.Field{
-		zap.Uint32("uqid", qCtx.Id()),
-		zap.String("qname", question.Name),
-		zap.Uint16("qtype", question.Qtype),
-		zap.Uint16("qclass", question.Qclass),
-		zap.Stringer("client", qCtx.ReqMeta().ClientAddr),
-		zap.Int("resp_rcode", respRcode),
-		zap.Duration("elapsed", time.Since(qCtx.StartTime())),
-		zap.Error(err),
+	if l.LocalLog {
+		// 构建日志字段
+		logFields := []zap.Field{
+			zap.Uint32("uqid", qCtx.Id()),
+			zap.String("qname", question.Name),
+			zap.Uint16("qtype", question.Qtype),
+			zap.Uint16("qclass", question.Qclass),
+			zap.Stringer("client", qCtx.ReqMeta().ClientAddr),
+			zap.Int("resp_rcode", respRcode),
+			zap.Duration("elapsed", time.Since(qCtx.StartTime())),
+			zap.Error(err),
+		}
+
+		// 如果有解析结果，添加到日志中
+		if len(answers) > 0 {
+			logFields = append(logFields, zap.Strings("answers", answers))
+		}
+
+		l.BP.L().Info(l.args.Msg, logFields...)
 	}
 
-	// 如果有解析结果，添加到日志中
-	if len(answers) > 0 {
-		logFields = append(logFields, zap.Strings("answers", answers))
-	}
-
-	l.BP.L().Info(l.args.Msg, logFields...)
-
-	// 如果启用了群晖日志，发送到 Syslog
-	if l.syslogger != nil {
-		l.sendToSynology(qCtx, question, respRcode, answers, err)
+	// 如果启用了群晖日志，异步发送到 Syslog
+	if l.logChan != nil {
+		l.sendToSynologyAsync(qCtx, question, respRcode, answers, err)
 	}
 
 	return err
 }
 
-// sendToSynology 发送日志到群晖 Syslog 服务
-func (l *logger) sendToSynology(qCtx *query_context.Context, question dns.Question, respRcode int, answers []string, err error) {
+// sendToSynologyAsync 异步发送日志到群晖 Syslog 服务
+func (l *logger) sendToSynologyAsync(qCtx *query_context.Context, question dns.Question, respRcode int, answers []string, err error) {
 	// 构建日志消息
 	var logParts []string
 
@@ -200,8 +209,23 @@ func (l *logger) sendToSynology(qCtx *query_context.Context, question dns.Questi
 
 	logMessage := strings.Join(logParts, " ")
 
-	// 发送到 Syslog
-	if syslogErr := l.syslogger.Info(logMessage); syslogErr != nil {
-		l.BP.L().Warn("failed to send log to synology", zap.Error(syslogErr))
+	// 非阻塞发送到通道
+	select {
+	case l.logChan <- logMessage:
+		// 成功发送到通道
+	default:
+		// 通道满了，丢弃这条日志，避免阻塞
+		l.BP.L().Warn("synology log channel is full, dropping log message")
+	}
+}
+
+// asyncLogHandler 异步处理日志发送
+func (l *logger) asyncLogHandler() {
+	for logMessage := range l.logChan {
+		if l.syslogger != nil {
+			if err := l.syslogger.Info(logMessage); err != nil {
+				l.BP.L().Warn("failed to send log to synology", zap.Error(err))
+			}
+		}
 	}
 }
